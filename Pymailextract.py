@@ -4,7 +4,9 @@ import base64
 import binascii
 import re
 import sys
-# from pprint import pprint
+import threading
+import time
+from pprint import pprint
 
 from apiclient.discovery import build
 from httplib2 import Http
@@ -13,7 +15,8 @@ POSITION = "/media/battleman/DATA/Documents/Programming/Python/Pymailextract/"
 SCOPE = 'https://mail.google.com/'
 POTENTIAL_FIELDS = ['from', 'to', 'cc', 'bcc', 'reply-to',
                     'sender', 'delivered-to', 'return-path', 'subject']
-ALL_MAILS = set()
+ADDRESSES_LOCK = threading.Lock()
+NUM_THREADS = 10
 MAIL_REGEX = r"((?:[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|" +\
     r"}~-]+)*|\"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|" +\
     r"\\[\x01-\x09\x0b\x0c\x0e-\x7f])*\")@(?:(?:[a-z0-9](?:[a-z0-9-]" +\
@@ -24,7 +27,7 @@ MAIL_REGEX = r"((?:[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|" +\
 
 PATTERN = re.compile(MAIL_REGEX, re.IGNORECASE)
 
-DEBUG = False
+DEBUG = True
 
 
 def get_service():
@@ -77,7 +80,7 @@ def correct_address(address):
 
     if len(address) > 40:
         if DEBUG:
-            return address
+            oddity = True
         try:
             print("The following address is odd:\n\t" + address)
             while True:
@@ -85,28 +88,12 @@ def correct_address(address):
                 if not confirm or confirm in "yYoO":
                     break
                 if confirm in "nN":
-                    address = None
+                    oddity = True
                     break
                 print("Please enter a valid answer")
         except EOFError:
             sys.exit("Exiting, as asked")
-    return address
-
-
-def parse_header(content):
-    """
-    Parses the header of a mail
-    """
-    for j in content['payload']['headers']:
-        if j['name'].lower() in POTENTIAL_FIELDS:
-            value = j['value']
-            value = value.replace("\\r", " ").replace("\\n", " ")
-            try:
-                for match in re.findall(PATTERN, value):
-                    if check_address(match[0]):
-                        ALL_MAILS.add(match[0].lower())
-            except AttributeError:
-                pass
+    return address, oddity
 
 
 def decode_base64(data):
@@ -126,6 +113,24 @@ def decode_base64(data):
             return base64.b64decode(data, '-_')
         except binascii.Error:
             return None
+
+
+def parse_header(content):
+    """
+    Parses the header of a mail
+    """
+    addresses = set()
+    for j in content['payload']['headers']:
+        if j['name'].lower() in POTENTIAL_FIELDS:
+            value = j['value']
+            value = value.replace("\\r", " ").replace("\\n", " ")
+            try:
+                for match in re.findall(PATTERN, value):
+                    if check_address(match[0]):
+                        addresses.add(match[0].lower())
+            except AttributeError:
+                return None
+    return addresses
 
 
 def parse_body(mail):
@@ -152,7 +157,7 @@ def parse_body(mail):
                         content.append(subpart['body']['data'])
     if pay['body']['size'] > 0:
         content.append(pay['body']['data'])
-
+    addresses = set()
     for cont in content:
         decoded = str(decode_base64(cont))
         decoded = decoded\
@@ -163,56 +168,117 @@ def parse_body(mail):
         try:
             for match in list(re.findall(PATTERN, decoded)):
                 if check_address(match[0]):
-                    ALL_MAILS.add(match[0].lower())
+                    addresses.add(match[0].lower())
         except AttributeError:
-            pass
+            return None
+    return addresses
 
 
-def get_message_list(token=None, query=""):
-    service = get_service()
+def extract_emails(ids_list, service=None):
+    found_addresses = set()
+    if not ids_list:
+        return
+    if not service:
+        service = get_service()
+
+    for uid in ids_list:
+        content = service.users().messages().get(userId='me',
+                                                 format="full",
+                                                 id=uid).execute()
+        found_addresses = found_addresses.union(parse_header(content))
+        found_addresses = found_addresses.union(parse_body(content))
+    return found_addresses
+
+
+def get_messages_list(token=None, query="", service=None):
+    if not service:
+        service = get_service()
     if token:
         results = service.users().messages().list(userId='me',
                                                   q=query,
                                                   pageToken=token).execute()
     else:
         results = service\
-            .users()\
-            .messages()\
+            .users().messages()\
             .list(userId='me', q=query)\
             .execute()
 
     mails_list = results.get('messages', [])
-    if mails_list:
-        for mail in mails_list:
-            uid = mail['id']
-            content = service.users().messages().get(userId='me',
-                                                     format="full",
-                                                     id=uid).execute()
-            parse_header(content)
-            parse_body(content)
     try:
-        return results['nextPageToken']
+        return results['nextPageToken'], mails_list
     except KeyError:
-        return None
+        return None, mails_list
+
+
+def chunks(target, num):
+    """Yield successive n-sized chunks from l."""
+    if num == 0:
+        yield target
+    else:
+        for i in range(0, len(target), num):
+            yield target[i:i + num]
+
+
+def get_all_emails_id():
+    """
+    Returns all the IDs of the emails in the user's mailbox
+    """
+    service = get_service()
+    mails_ids = []
+    token, mails_list = get_messages_list(service=service)
+    if not token:
+        return [mail['id'] for mail in mails_list]
+    while token:
+        for mail in mails_list:
+            mails_ids.append(mail['id'])
+        token, mails_list = get_messages_list(token=token, service=service)
+    return mails_ids
+
+class MyThread(threading.Thread):
+    def __init__(self, threadID, ids_list):
+        super().__init__()
+        self.threadID = threadID
+        self.ids_list = ids_list
+        self.result = set()
+
+    def run(self):
+        pprint("Thread {}, starting run".format(self.threadID))
+        addresses = extract_emails(self.ids_list)
+        # ADDRESSES_LOCK.acquire()
+        pprint("Thread {}, giving back my results".format(self.threadID))
+        self.result = self.result.union(addresses)
+        # ADDRESSES_LOCK.release()
+
+    def join(self):
+        super().join()
+        return self.result
 
 
 def main():
     """
     Main
     """
-    i = 1
-    print("Page 1")
-    token = get_message_list()
-    while token:
-        i += 1
-        print("Page", i)
-        token = get_message_list(token=token)
+    start = time.time()
+    mails_ids = get_all_emails_id()
+    if not mails_ids:
+        return
+    sublists = list(chunks(mails_ids, len(mails_ids)//NUM_THREADS))
+    threads_list = []
+    for num_thread in range(NUM_THREADS):
+        thread = MyThread(num_thread, sublists[num_thread])
+        thread.start()
+        threads_list.append(thread)
 
-    with open(POSITION+"email_addresses.txt", "w") as dst:
-        for item in ALL_MAILS:
+    all_addresses = set()
+    for thread in threads_list:
+        all_addresses = all_addresses.union(thread.join())
+
+    with open(POSITION+"parallelized_email_addresses.txt", "w") as dst:
+        for item in all_addresses:
             addr = correct_address(item)
             if addr:
                 dst.write("%s\n" % addr)
+    print("Finished in ", time.time()-start, "seconds")
 
 
 if __name__ == "__main__":
