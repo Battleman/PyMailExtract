@@ -1,0 +1,8 @@
+client_secret.json
+.vscode
+credentials.json
+email_addresses.txt
+extracted_premium.txt
+parallelized_email_addresses.txt
+tester.py
+token.json
