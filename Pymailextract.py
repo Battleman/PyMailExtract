@@ -7,14 +7,17 @@ import sys
 import threading
 import time
 from pprint import pprint
+import os
 
 from apiclient.discovery import build
 from httplib2 import Http
 from oauth2client import client, file, tools
-POSITION = "/media/battleman/DATA/Documents/Programming/Python/Pymailextract/"
+
+POSITION = os.path.dirname(os.path.abspath(__file__))+"/"
 SCOPE = 'https://mail.google.com/'
 POTENTIAL_FIELDS = ['from', 'to', 'cc', 'bcc', 'reply-to',
                     'sender', 'delivered-to', 'return-path', 'subject']
+
 ADDRESSES_LOCK = threading.Lock()
 NUM_THREADS = 10
 MAIL_REGEX = r"((?:[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|" +\
@@ -35,12 +38,10 @@ def get_service():
     Get a google api service, by reading and sending credentials. Automatic
     renewal if not valid.
     """
-    store = file.Storage(POSITION+'credentials.json')
+    store = file.Storage(POSITION+'token.json')
     creds = store.get()
     if not creds or creds.invalid:
-        print("Credentials invalid, renewing")
-        flow = client.flow_from_clientsecrets(
-            POSITION+'client_secret.json', SCOPE)
+        flow = client.flow_from_clientsecrets('credentials.json', SCOPE)
         creds = tools.run_flow(flow, store)
     service = build('gmail', 'v1', http=creds.authorize(Http()))
     return service
